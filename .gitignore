@@ -1,0 +1,14 @@
+# CHIRP source — clone separately (see README): git clone --depth 1 https://github.com/kk7ds/chirp _chirp
+_chirp/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Radio data / generated files — never commit personal channel data or backups
+*.dat
+*.img
+*.csv
+*.json
