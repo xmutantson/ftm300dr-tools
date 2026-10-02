@@ -19,8 +19,6 @@ if _CHIRP_SRC not in sys.path:
 
 logging.getLogger("chirp").setLevel(logging.ERROR)
 
-from chirp.drivers import ft60  # noqa: E402  (registers the FT60 driver)
-
 from neutral import (  # noqa: E402
     NeutralChannel, Duplex, Mode, ToneMode, OpMode, Power,
 )
@@ -55,22 +53,28 @@ def _tx_freq(rx: int, duplex: str, offset: int) -> int:
 
 
 def memory_to_neutral(m, index: int, default_op_mode: OpMode = OpMode.FM) -> NeutralChannel:
+    for value, mapping, label in ((m.duplex, _DUPLEX, "duplex"), (m.mode, _MODE, "mode"), (m.tmode, _TMODE, "tone mode")):
+        if value not in mapping:
+            raise ValueError(f"FT-60 channel {m.number}: unsupported {label} {value!r}")
+    if m.skip not in ("", "S", "P"):
+        raise ValueError(f"FT-60 channel {m.number}: unsupported skip {m.skip!r}")
     return NeutralChannel(
         index=index,
         name=(m.name or "").strip(),
         rx_freq_hz=int(m.freq),
         tx_freq_hz=_tx_freq(int(m.freq), m.duplex, int(m.offset)),
-        duplex=_DUPLEX.get(m.duplex, Duplex.NONE),
+        duplex=_DUPLEX[m.duplex],
         offset_hz=int(m.offset),
         tuning_step_hz=int(round(float(m.tuning_step) * 1000)),
-        mode=_MODE.get(m.mode, Mode.FM),
-        tone_mode=_TMODE.get(m.tmode, ToneMode.NONE),
+        mode=_MODE[m.mode],
+        tone_mode=_TMODE[m.tmode],
         ctcss_tx_hz=float(m.rtone),
-        ctcss_rx_hz=float(m.ctone),
+        # FT-60 has_ctone=False: its sole tone is in rtone, ctone is inactive.
+        ctcss_rx_hz=float(m.rtone) if m.tmode == "TSQL" else float(m.ctone),
         dtcs_code=int(m.dtcs),
         dtcs_polarity=m.dtcs_polarity or "NN",
         power=_map_power(m.power),
-        skip=bool(m.skip),                       # "" -> False, "S"/"P" -> True
+        skip=m.skip,
         op_mode=default_op_mode,
         bank=None,
         cross_mode=getattr(m, "cross_mode", "") if m.tmode == "Cross" else "",
@@ -80,6 +84,7 @@ def memory_to_neutral(m, index: int, default_op_mode: OpMode = OpMode.FM) -> Neu
 
 def read_ft60(path: str, default_op_mode: OpMode = OpMode.FM) -> list[NeutralChannel]:
     """Parse an FT-60 .img clone into neutral channels (populated slots only)."""
+    from chirp.drivers import ft60
     radio = ft60.FT60Radio(path)
     lo, hi = radio.get_features().memory_bounds
     out: list[NeutralChannel] = []
