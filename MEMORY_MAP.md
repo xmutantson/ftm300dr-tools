@@ -21,10 +21,16 @@ FTM-300-specific.
 | 0x0000–0x0080    | header (magic, counts) |
 | 0x0080–0x00A0    | VFO A / VFO B |
 | 0x00A0–0x0800    | settings (callsign ASCII @0x2C8, APRS, etc.) |
-| 0x0800–0x4CB0    | **memory channel table** — 16 bytes/channel, channel *N* @ `0x800 + (N-1)*16` (999 ch) |
+| 0x0800-0x4670    | **999 user memory records** - 16 bytes/channel, channel *N* @ `0x800 + (N-1)*16` |
+| 0x4670-0x4CB0    | **100 additional records, purpose unknown** - preserved by both tools |
 | 0x4CB0–0x5546    | **name-length table** — 2 bytes/channel |
 | 0x10000–0x144B0  | **name table** — 16 bytes/channel, ASCII, `0xFF`-padded |
 | (elsewhere)      | APRS / GPS / settings carried over verbatim |
+
+Ranges above are start-inclusive, end-exclusive. The full record area contains
+1099 records: `0x800 + 1099 * 16 == 0x4CB0`, with no overlap into the name-length
+table. Only the first 999 slots are user-editable. Corresponding extra name entries
+at `0x13E70..0x144B0` and name-length entries at `0x547E..0x5546` are also preserved.
 
 ## 16-byte channel record
 
@@ -54,7 +60,8 @@ bcd(x)  = (x >> 4) * 10 + (x & 0x0F)
 
 The high nibble of byte 2 is a weighted fine-step field (bit3 = +5 kHz, bit2 = +2.5 kHz,
 bit1 = +1.25 kHz), i.e. `nibble * 0.625 kHz`. Examples: `01 46 52` = 146.520 MHz; `44 62 56` =
-462.5625 MHz (446... +2.5 kHz). Representable down to a 1.25 kHz grid.
+462.5625 MHz (462 MHz + 560 kHz + 2.5 kHz). The codec accepts a 625 Hz grid;
+that arithmetic resolution is not evidence that the radio supports every such channel.
 
 ### Tones
 

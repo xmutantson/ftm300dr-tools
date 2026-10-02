@@ -13,6 +13,8 @@ _TMODE = {0: ToneMode.NONE, 1: ToneMode.TONE, 2: ToneMode.TSQL, 4: ToneMode.DTCS
 
 def read_channel(data, slot: int):
     """Return a NeutralChannel for `slot` (1-based), or None if the slot is empty."""
+    fmt.validate_backup(data)
+    fmt.validate_slot(slot)
     rec = data[fmt.mem_offset(slot):fmt.mem_offset(slot) + fmt.REC_SIZE]
     if not (rec[0] & fmt.IN_USE_BIT):
         return None
@@ -23,20 +25,23 @@ def read_channel(data, slot: int):
     idx = rec[9] & 0x3F
     dcs = fmt.DTCS_CODES[rec[10] - 1] if 0 < rec[10] <= len(fmt.DTCS_CODES) else 23
     oddsplit = bool(rec[1] & fmt.ODDSPLIT_BIT)
+    duplex = Duplex.SPLIT if oddsplit else _DUP.get(rec[1] & 0x03, Duplex.UNKNOWN)
+    offset = rec[13] * 50_000
+    tx = freq + offset if duplex == Duplex.PLUS else freq - offset if duplex == Duplex.MINUS else freq
     return NeutralChannel(
         index=slot - 1,
         name=name,
         rx_freq_hz=freq,
-        tx_freq_hz=fmt.freq_decode(rec[6], rec[7], rec[8]) if oddsplit else freq,
-        duplex=Duplex.SPLIT if oddsplit else _DUP.get(rec[1] & 0x03, Duplex.NONE),
-        offset_hz=rec[13] * 50_000,
-        mode=Mode.NFM if (rec[1] & fmt.NARROW_BIT) else Mode.FM,
-        tone_mode=_TMODE.get(rec[5] >> 4, ToneMode.NONE),
-        ctcss_tx_hz=fmt.CTCSS[idx] if idx < len(fmt.CTCSS) else 100.0,
-        ctcss_rx_hz=fmt.CTCSS[idx] if idx < len(fmt.CTCSS) else 100.0,
-        dtcs_code=dcs,
-        power=_PWR.get(rec[9] & 0xC0, Power.HIGH),
-        skip=bool((rec[0] >> fmt.SKIP_BIT) & 0x1),
+        tx_freq_hz=fmt.freq_decode(rec[6], rec[7], rec[8]) if oddsplit else tx,
+        duplex=duplex,
+        offset_hz=offset,
+        mode=(Mode.NFM if rec[1] & fmt.NARROW_BIT else Mode.FM) if rec[1] & 0xD0 == 0x40 else Mode.UNKNOWN,
+        tone_mode=_TMODE.get(rec[5] >> 4, ToneMode.UNKNOWN),
+        ctcss_tx_hz=fmt.CTCSS[idx] if idx < len(fmt.CTCSS) else 0.0,
+        ctcss_rx_hz=fmt.CTCSS[idx] if idx < len(fmt.CTCSS) else 0.0,
+        dtcs_code=dcs if 0 < rec[10] <= len(fmt.DTCS_CODES) else 0,
+        power=_PWR.get(rec[9] & 0xC0, Power.UNKNOWN),
+        skip={0: "", 1: "S", 2: "P"}.get((rec[0] >> fmt.SKIP_BIT) & 3, "unknown"),
         op_mode=OpMode.FM,
         source_slot=slot,
     )

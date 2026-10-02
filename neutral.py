@@ -13,6 +13,7 @@ from typing import Optional
 
 
 class Duplex(str, Enum):
+    UNKNOWN = "unknown"  # preserve existing records; never synthesize this value
     NONE = "none"     # simplex, tx == rx
     PLUS = "+"        # tx = rx + offset
     MINUS = "-"       # tx = rx - offset
@@ -21,12 +22,14 @@ class Duplex(str, Enum):
 
 
 class Mode(str, Enum):
+    UNKNOWN = "unknown"
     FM = "FM"
     NFM = "NFM"
     AM = "AM"
 
 
 class ToneMode(str, Enum):
+    UNKNOWN = "unknown"
     NONE = "none"
     TONE = "TONE"     # CTCSS encode only (TX tone)        -> 300DR "TN"
     TSQL = "TSQL"     # CTCSS encode + decode               -> 300DR "TSQ"
@@ -35,8 +38,7 @@ class ToneMode(str, Enum):
 
 
 class OpMode(str, Enum):
-    """FTM-300DR per-channel operating mode. FT-60 is analog only, so the
-    reader defaults this to FM; switch the default to AMS if desired."""
+    """Only FM encoding is currently supported; other values must be rejected."""
     FM = "FM"
     AMS = "AMS"
     DN = "DN"
@@ -44,6 +46,7 @@ class OpMode(str, Enum):
 
 
 class Power(str, Enum):
+    UNKNOWN = "unknown"
     HIGH = "High"
     MID = "Mid"
     LOW = "Low"
@@ -65,7 +68,7 @@ class NeutralChannel:
     dtcs_code: int = 23
     dtcs_polarity: str = "NN"
     power: Power = Power.HIGH
-    skip: bool = False
+    skip: bool | str = False         # False/True legacy aliases; "", "S", "P"
     op_mode: OpMode = OpMode.FM      # 300DR-specific; defaulted for analog FT-60 source
     bank: Optional[int] = None
     cross_mode: str = ""             # populated only when tone_mode == CROSS

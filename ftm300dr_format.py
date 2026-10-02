@@ -16,12 +16,15 @@ Name table @0x10000 (16 bytes/ch, ASCII, 0xFF pad); name-LENGTH table @0x4cb0 (2
 """
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
+
 FILE_SIZE = 0x18000
 MAGIC = b"AH071$"
 
 MEM_TABLE_BASE = 0x800
 REC_SIZE = 16
 REC_COUNT = 1099
+USER_CHANNEL_COUNT = 999  # remaining 100 records have unknown roles
 NAME_TABLE_BASE = 0x10000
 NAME_SIZE = 16
 NAME_PAD = 0xFF
@@ -50,7 +53,7 @@ POWER_BITS_INV = {v: k for k, v in POWER_BITS.items()}
 
 # tone MODE = byte5 high nibble (FTM-400 "sql" field): 0 none / 1 TONE(encode) /
 # 2 TSQL(tone squelch) / 4 DTCS. CTCSS index lives in byte9, DCS code index in byte10.
-SQL_MODE = {"none": 0, "TONE": 1, "TSQL": 2, "DTCS": 4, "cross": 1}
+SQL_MODE = {"none": 0, "TONE": 1, "TSQL": 2, "DTCS": 4}
 SQL_MODE_INV = {0: "none", 1: "TONE", 2: "TSQL", 4: "DTCS"}
 SKIP_BIT = 5                              # scan-skip = byte0 bits 5-6 (SKIPS ['', 'S', 'P'])
 ODDSPLIT_BIT = 0x04                       # byte1 bit2 = odd split; TX freq in bytes 6-8
@@ -109,6 +112,8 @@ def freq_decode(b2: int, b3: int, b4: int) -> int:
 
 
 def freq_encode_bytes(hz: int) -> tuple[int, int, int]:
+    if not isinstance(hz, int) or not 0 < hz < 1_000_000_000:
+        raise ValueError("Frequency must be an integer Hz value between 0 and 1000 MHz")
     mhz, frac = divmod(hz, 1_000_000)
     khz10, sub = divmod(frac, 10_000)
     fine, rem = divmod(sub, 625)
@@ -123,16 +128,91 @@ def freq_encode_bytes(hz: int) -> tuple[int, int, int]:
 
 
 # --- whole 16-byte record ---
+def validate_backup(data) -> None:
+    if len(data) != FILE_SIZE or bytes(data[:len(MAGIC)]) != MAGIC:
+        raise ValueError(f"Expected an FTM-300DR backup: {FILE_SIZE} bytes with AH071$ header")
+
+
+def validate_slot(slot: int) -> None:
+    if not isinstance(slot, int) or isinstance(slot, bool) or not 1 <= slot <= USER_CHANNEL_COUNT:
+        raise ValueError("Channel slot must be an integer in 1..999")
+
+
+def mhz_text(hz: int) -> str:
+    return f"{hz // 1_000_000}.{hz % 1_000_000:06d}"
+
+
+def parse_mhz(text: str) -> int:
+    try:
+        hz = Decimal(text.strip()) * 1_000_000
+        if not hz.is_finite() or hz != hz.to_integral_value():
+            raise ValueError("Frequency must be a whole number of Hz")
+        result = int(hz)
+    except InvalidOperation as exc:
+        raise ValueError("Invalid frequency") from exc
+    freq_encode_bytes(result)
+    return result
+
+
+def skip_code(value) -> int:
+    if value is False or value == "":
+        return 0
+    if value is True or value == "S":
+        return 1
+    if value == "P":
+        return 2
+    raise ValueError(f"Unsupported scan-skip value: {value!r}")
+
+
+def validate_channel(ch) -> None:
+    from neutral import Duplex, Mode, OpMode, ToneMode
+    if ch.mode not in (Mode.FM, Mode.NFM):
+        raise ValueError(f"Unsupported modulation: {ch.mode}")
+    if ch.op_mode != OpMode.FM:
+        raise ValueError("Only analog FM operating mode has an implemented encoding")
+    if ch.duplex not in (Duplex.NONE, Duplex.PLUS, Duplex.MINUS, Duplex.SPLIT):
+        raise ValueError(f"Unsupported duplex: {ch.duplex}; receive-only encoding is unknown")
+    if ch.tone_mode not in (ToneMode.NONE, ToneMode.TONE, ToneMode.TSQL, ToneMode.DTCS):
+        raise ValueError(f"Unsupported tone mode: {ch.tone_mode}")
+    if ch.tuning_step_hz:
+        raise ValueError("Tuning-step encoding is unknown")
+    freq_encode_bytes(ch.rx_freq_hz)
+    if not (137_000_000 <= ch.rx_freq_hz < 174_000_000 or 400_000_000 <= ch.rx_freq_hz < 480_000_000):
+        raise ValueError("Band encoding is only implemented for 137-174 and 400-480 MHz")
+    if ch.duplex == Duplex.SPLIT:
+        freq_encode_bytes(ch.tx_freq_hz)
+    elif ch.duplex in (Duplex.PLUS, Duplex.MINUS):
+        if not isinstance(ch.offset_hz, int) or not 0 <= ch.offset_hz <= 255 * 50_000 or ch.offset_hz % 50_000:
+            raise ValueError("Repeater offset must be 0..12.75 MHz on the 50 kHz grid")
+        expected = ch.rx_freq_hz + (ch.offset_hz if ch.duplex == Duplex.PLUS else -ch.offset_hz)
+        if ch.tx_freq_hz != expected:
+            raise ValueError("TX frequency disagrees with repeater offset")
+        freq_encode_bytes(expected)
+    elif ch.tx_freq_hz != ch.rx_freq_hz:
+        raise ValueError("Simplex TX frequency must equal RX frequency")
+    if ch.tone_mode in (ToneMode.TONE, ToneMode.TSQL) and ch.ctcss_tx_hz not in CTCSS:
+        raise ValueError("CTCSS tone is not in the supported table")
+    if ch.tone_mode == ToneMode.TSQL and ch.ctcss_rx_hz != ch.ctcss_tx_hz:
+        raise ValueError("Separate RX/TX CTCSS tones are unsupported")
+    if ch.tone_mode == ToneMode.DTCS and (ch.dtcs_code not in DTCS_CODES or ch.dtcs_polarity != "NN"):
+        raise ValueError("DCS requires a supported code and NN polarity")
+    if ch.power not in POWER_BITS:
+        raise ValueError(f"Unsupported power: {ch.power}")
+    skip_code(ch.skip)
+    encode_name(ch.name)
+
+
 def encode_record(ch) -> bytes:
     """ch is a neutral.NeutralChannel (analog). Returns 16 bytes.
     Within-record layout corroborated by the FTM-400D RE (CHIRP #1469 / kz7zzz/ftm-400d).
     NOTE: scan-skip, DCS, and TSQL come from the FTM-400 sibling map (high confidence,
     same family) — verified on the 300 for skip via capture if available; DCS untested."""
     from neutral import Duplex
+    validate_channel(ch)
     b0n, b5n, b13_def = band_params(ch.rx_freq_hz)
     tmode = ch.tone_mode.value if hasattr(ch.tone_mode, "value") else ch.tone_mode
     rec = bytearray(16)
-    skip = 1 if getattr(ch, "skip", False) else 0
+    skip = skip_code(ch.skip)
     rec[0] = IN_USE_BIT | (skip << SKIP_BIT) | b0n
     rec[2], rec[3], rec[4] = freq_encode_bytes(ch.rx_freq_hz)
     narrow = NARROW_BIT if (getattr(ch.mode, "value", ch.mode) == "NFM") else 0
@@ -141,7 +221,7 @@ def encode_record(ch) -> bytes:
         rec[6], rec[7], rec[8] = freq_encode_bytes(ch.tx_freq_hz)   # split TX freq
     else:
         shift = {Duplex.NONE: "none", Duplex.PLUS: "+",
-                 Duplex.MINUS: "-", Duplex.OFF: "none"}[ch.duplex]
+                 Duplex.MINUS: "-"}[ch.duplex]
         rec[1] = (MODE_FM << 4) | narrow | SHIFT_CODE[shift]
     rec[5] = (SQL_MODE.get(tmode, 0) << 4) | b5n
     idx = ctcss_index(ch.ctcss_tx_hz) if tmode in ("TONE", "TSQL") else CTCSS_DEFAULT_IDX
@@ -150,8 +230,8 @@ def encode_record(ch) -> bytes:
     if tmode == "DTCS":
         rec[10] = dtcs_index(ch.dtcs_code) & 0x7F
     rec[11] = 0x0F
-    if ch.duplex in (Duplex.MINUS, Duplex.PLUS) and ch.offset_hz:
-        rec[13] = max(0, min(0xFF, round(ch.offset_hz / 50_000)))   # offset / 50 kHz
+    if ch.duplex in (Duplex.MINUS, Duplex.PLUS):
+        rec[13] = ch.offset_hz // 50_000
     else:
         rec[13] = b13_def
     return bytes(rec)
@@ -176,7 +256,12 @@ def decode_record(rec: bytes) -> dict:
 
 
 def encode_name(name: str) -> bytes:
-    b = (name or "").encode("ascii", "replace")[:NAME_SIZE]
+    try:
+        b = (name or "").encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("Channel names must contain ASCII characters only") from exc
+    if len(b) > NAME_SIZE or any(x < 32 or x > 126 for x in b):
+        raise ValueError("Channel names must contain at most 16 printable ASCII characters")
     return b + bytes([NAME_PAD]) * (NAME_SIZE - len(b))
 
 

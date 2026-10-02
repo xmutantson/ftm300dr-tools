@@ -15,12 +15,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext, simpledialog
 
 import converter_core as cc
+import ftm300dr_format as fmt
+from backup_io import same_path
 from neutral import OpMode, Duplex, ToneMode
 
 DEF_IMG = ""        # browse to your FT-60 .img clone (CHIRP image)
 DEF_TMPL = ""       # browse to a real FTM-300DR backup (CLNFTM300D.dat) to use as the template
 DEF_OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CLNFTM300D.dat")
-UNBANKED = "(un-banked)"
+UNBANKED = cc.UNBANKED
 
 
 def _dup(ch):
@@ -32,7 +34,7 @@ def _tone(ch):
 
 
 def _detail(ch):
-    return f"{ch.rx_freq_hz/1e6:9.4f}  {_dup(ch):4} {ch.mode.value:3} {_tone(ch)}"
+    return f"{fmt.mhz_text(ch.rx_freq_hz)}  {_dup(ch):4} {ch.mode.value:3} {_tone(ch)}"
 
 
 class App(ttk.Frame):
@@ -51,11 +53,13 @@ class App(ttk.Frame):
         self.labels: dict = {}
         self.included: set = set()
         self.last_report = []
+        self.loaded_source_path = None
 
         self._build_files()
         self._build_main()
         self._build_actions()
         self._build_report()
+        self.var_gap.trace_add("write", lambda *_: self._refresh_tree())
 
         if DEF_IMG and os.path.exists(DEF_IMG):
             self.var_img.set(DEF_IMG)
@@ -150,52 +154,57 @@ class App(ttk.Frame):
         self.var_power = tk.BooleanVar(value=True)
         self.var_skip = tk.BooleanVar(value=True)
         self.var_narrow = tk.BooleanVar(value=True)
-        for i, (txt, var) in enumerate([("Channel name (TAG)", self.var_name), ("CTCSS tone", self.var_tone),
-                                        ("Repeater shift (+/-)", self.var_shift), ("TX power", self.var_power),
+        for i, (txt, var) in enumerate([("Channel name (TAG)", self.var_name), ("Tone / squelch (CTCSS/DCS)", self.var_tone),
+                                        ("Duplex / repeater offset", self.var_shift), ("TX power", self.var_power),
                                         ("Scan-skip flag", self.var_skip), ("FM narrow (NFM) flag", self.var_narrow)]):
-            ttk.Checkbutton(of, text=txt, variable=var).grid(row=i, column=0, columnspan=2, sticky="w")
+            ttk.Checkbutton(of, text=txt, variable=var, command=self._refresh_tree).grid(row=i, column=0, columnspan=2, sticky="w")
         ttk.Label(of, text="Gap between blocks").grid(row=6, column=0, sticky="w", pady=(8, 0))
         self.var_gap = tk.IntVar(value=0)
         ttk.Spinbox(of, from_=0, to=50, width=5, textvariable=self.var_gap,
                     command=self._refresh_tree).grid(row=6, column=1, sticky="w")
         ttk.Label(of, text="Operating mode").grid(row=7, column=0, sticky="w")
         self.var_op = tk.StringVar(value="FM")
-        ttk.Combobox(of, textvariable=self.var_op, values=["FM", "AMS"], width=6,
+        ttk.Combobox(of, textvariable=self.var_op, values=["FM"], width=6,
                      state="readonly").grid(row=7, column=1, sticky="w")
         ttk.Label(of, text="(Un-banked channels appear as their\nown bank — use/reorder like any other.)",
                   foreground="#666").grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        ttk.Label(of, text="(FM wide/narrow is a global radio\nsetting, not per-channel.)",
+        ttk.Label(of, text="Tuning step is not copied (unmapped).\nFM/NFM stored per channel; DCS unverified.",
                   foreground="#666").grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
     # ---------- data / tree ----------
     def _load_image(self):
         try:
-            self.channels, self.bank_members, order = cc.load_source(self.var_img.get())
+            channels, bank_members, order = cc.load_source(self.var_img.get())
         except Exception as e:
+            self.var_img.set(self.loaded_source_path or "")
             messagebox.showerror("Load error", f"Could not read image:\n{e}")
             return
+        self.channels, self.bank_members = channels, bank_members
+        self.loaded_source_path = self.var_img.get()
+        self.last_report = []
+        self.report.delete("1.0", "end")
         self.bank_order = [b for b in order if self.bank_members.get(b)]
-        banked = set().union(*self.bank_members.values()) if self.bank_members else set()
-        unbanked = set(self.channels) - banked
-        if unbanked:
-            self.bank_members[UNBANKED] = unbanked
-            self.bank_order.append(UNBANKED)
         self.labels = {b: b for b in self.bank_order}
         self.included = set(self.bank_order)
         self._refresh_tree()
 
-    def _layout(self):
-        return cc.assign_slots(self.channels, self.bank_members, self.bank_order, set(self.included),
-                               include_unbanked=False, gap=self.var_gap.get(), start=1)
+    def _plan(self):
+        return cc.build_plan(self.channels, self.bank_members, priority=self.bank_order,
+                             included=set(self.included), fields=self._fields(),
+                             include_unbanked=False, gap=self.var_gap.get(), start=1)
 
     def _refresh_tree(self):
-        if not self.bank_order:
-            return
         open_state = {b: self.tree.item(b, "open") for b in self.bank_order if self.tree.exists(b)}
         sel = self.tree.selection()
+        try:
+            plan = self._plan()
+        except (ValueError, tk.TclError) as e:
+            self.status.config(text=str(e))
+            return
         self.tree.delete(*self.tree.get_children())
-
-        layout = self._layout()
+        layout = list(plan.report) + list(plan.dropped)
+        planned_channels = {row["source"]: ch for row, ch in zip(plan.report, plan.channels)}
+        self.status.config(text=f"Overflow: {len(plan.dropped)} channels; output blocked" if plan.dropped else f"Preview: {len(plan.channels)} channels")
         target_of = {it["source"]: it["target"] for it in layout}
         owner_of = {it["source"]: it["bank"] for it in layout}
 
@@ -215,7 +224,7 @@ class App(ttk.Frame):
                              text=f"{mark} {label(b)}",
                              values=(f"{b} · {len(here)}/{len(members)} here", rng))
             for s in members:
-                ch = self.channels[s]
+                ch = planned_channels.get(s, self.channels[s])
                 if owner_of.get(s) == b:
                     note, ctag = f"ch {target_of[s]}", ()
                 elif b in self.included:
@@ -301,18 +310,23 @@ class App(ttk.Frame):
         return dict(copy_name=self.var_name.get(), copy_tone=self.var_tone.get(),
                     copy_shift=self.var_shift.get(), copy_power=self.var_power.get(),
                     copy_skip=self.var_skip.get(), copy_narrow=self.var_narrow.get(),
-                    op_mode=OpMode.AMS if self.var_op.get() == "AMS" else OpMode.FM)
+                    op_mode=OpMode.FM, copy_tuning_step=False)
 
     def _generate(self):
         if not self.bank_order:
             messagebox.showwarning("No image", "Load an FT-60 image first.")
             return
         try:
-            report, dropped = cc.generate(
-                self.var_img.get(), self.var_tmpl.get(), self.var_out.get(),
-                priority=self.bank_order, included=set(self.included), fields=self._fields(),
-                callsign=self.var_call.get().strip().upper(),
-                include_unbanked=False, gap=self.var_gap.get(), start=1)
+            if not self.loaded_source_path or not same_path(self.var_img.get(), self.loaded_source_path):
+                raise ValueError("Source path changed; load the image with Browse before generating")
+            plan = self._plan()
+            if plan.dropped:
+                raise ValueError(f"Overflow: {len(plan.dropped)} channels exceed slot 999; reduce gaps or included banks")
+            if os.path.exists(self.var_out.get()) and not messagebox.askyesno("Replace output", "Replace the existing output file?"):
+                return
+            report, dropped = cc.generate_plan(
+                plan, self.var_tmpl.get(), self.var_out.get(),
+                callsign=self.var_call.get().strip().upper(), source_path=self.loaded_source_path)
         except Exception as e:
             messagebox.showerror("Generate error", str(e))
             return
@@ -327,7 +341,7 @@ class App(ttk.Frame):
             if lab != last:
                 self.report.insert("end", f"--- {lab} ---\n")
                 last = lab
-            self.report.insert("end", f"{r['target']:>4}  {r['name']:16s} {r['freq_hz']/1e6:.4f}\n")
+            self.report.insert("end", f"{r['target']:>4}  {r['name']:16s} {fmt.mhz_text(r['freq_hz'])}\n")
         self.status.config(text=f"Done: {len(report)} channels.")
 
     def _export(self):
@@ -342,7 +356,7 @@ class App(ttk.Frame):
             w = csv.writer(fh)
             w.writerow(["ch", "name", "freq_MHz", "bank_label", "ft60_ch"])
             for r in self.last_report:
-                w.writerow([r["target"], r["name"], f"{r['freq_hz']/1e6:.4f}",
+                w.writerow([r["target"], r["name"], fmt.mhz_text(r['freq_hz']),
                             self.labels.get(r["bank"], r["bank"]), r["source"]])
         self.status.config(text=f"Exported -> {p}")
 
